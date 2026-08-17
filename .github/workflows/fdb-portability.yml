@@ -21,6 +21,16 @@ on:
   workflow_dispatch:
   push:
     branches: [portability-consensus]
+  # A pull request into the branch this workflow guards runs it too. Without this a change
+  # to the workflow could not be tested by the workflow: the fix for the exit 127 that
+  # killed run 31594247582 sat as a draft reporting "no checks", because nothing triggered
+  # on a pull request and there was therefore nothing for it to pass. A change to CI is the
+  # change that most needs CI.
+  #
+  # Scoped to that one base branch rather than every pull request, because this is three
+  # platforms building FoundationDB from source and the cost is real.
+  pull_request:
+    branches: [portability-consensus]
 
 permissions:
   contents: read
@@ -42,7 +52,7 @@ jobs:
           - os: linux
             runner: ubuntu-24.04
             container: foundationdb/build:rockylinux9-latest
-            fdbserver_jobs: 3
+            build_jobs: 2
           # Apple silicon, so this is the arm64 build. CMAKE_SYSTEM_PROCESSOR is "arm64",
           # not "aarch64", so ConfigureCompiler.cmake:428 does not add -march=armv8.2-a,
           # and USE_AVX finds no ^x86 and disables itself. 3 cores and 7 GB, the least
@@ -50,11 +60,11 @@ jobs:
           - os: macos
             runner: macos-14
             container: ""
-            fdbserver_jobs: 3
+            build_jobs: 3
           - os: windows
             runner: windows-2025
             container: ""
-            fdbserver_jobs: 4
+            build_jobs: 4
 
     env:
       VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-cache,readwrite"
@@ -159,11 +169,40 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          # FDB_RELEASE=ON drops "-SNAPSHOT" and the build timestamp, so two runs of the same
-          # commit produce the same package name (CMakeLists.txt:96).
-          COMMON="-DBUILD_TESTING=OFF -DBUILD_DOCUMENTATION=OFF -DWITH_SWIFT=OFF
+          # Deterministic package names without FDB_RELEASE.
+          #
+          # FDB_RELEASE=ON was set to drop the build timestamp so two runs of the same commit
+          # name their packages the same (CMakeLists.txt:96). It also does something the
+          # comment never said: ConfigureCompiler.cmake:181 reads it as "generate full debug
+          # symbols" and emits -ggdb instead of -ggdb1, and :191 then refuses to compress
+          # them because CPack cannot build a debuginfo package from compressed sections. So
+          # a naming convenience bought the largest debug info clang can emit, uncompressed,
+          # on the actor-generated translation units -- which are the ones that killed the
+          # linux job at [328/595].
+          #
+          # CMakeLists.txt:100 already offers the honest way to get the same names:
+          # FDB_BUILDTIME is a cache variable "required to achieve uniform naming across
+          # different builds". Pinned to the commit's own date, two runs of one commit agree
+          # and two different commits do not, which is what was wanted. -ggdb1 and -gz come
+          # back with it.
+          #
+          # The checkout is owned by a different uid than the container runs as, so git
+          # refuses it as "dubious ownership". This step runs under bash -e, so that refusal
+          # ended the step before cmake was reached, which is why the first attempt failed in
+          # seconds with no configure output at all. Marking it safe is the documented fix,
+          # and the value is checked rather than assumed: a package named after an empty
+          # timestamp is worse than one named after a real clock.
+          git config --global --add safe.directory "$PWD" || true
+          STAMP=$(git show -s --format=%cd --date=format:%Y%m%d%H%M%S HEAD 2>/dev/null || true)
+          if [ -z "$STAMP" ]; then
+            echo "::error::cannot read the commit date, so package names would not be reproducible"
+            exit 1
+          fi
+          echo "package timestamp pinned to the commit: $STAMP"
+          COMMON="-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+                  -DBUILD_TESTING=OFF -DBUILD_DOCUMENTATION=OFF -DWITH_SWIFT=OFF
                   -DWITH_JAVA_BINDING=OFF -DWITH_GO_BINDING=OFF -DWITH_RUBY_BINDING=OFF
-                  -DFDB_RELEASE=ON"
+                  -DFDB_BUILDTIME=$STAMP"
           if [ "${{ matrix.os }}" = windows ]; then
             # No -G: CMake's default is the newest installed Visual Studio, and this runner
             # ships VS 18, so naming "Visual Studio 17 2022" named one that is not there.
@@ -181,7 +220,7 @@ jobs:
               -DBoost_COMPILER=vc143 -DBoost_USE_STATIC_LIBS=ON \
               -DBoost_USE_STATIC_RUNTIME=ON \
               -DVCPKG_TARGET_TRIPLET=x64-windows-static \
-              -DWITH_TLS=OFF -DUSE_JEMALLOC=OFF -DWITH_ROCKSDB=OFF 2>&1 | tee configure.log
+              -DWITH_TLS=OFF -DUSE_JEMALLOC=OFF -DSSD_ROCKSDB_EXPERIMENTAL=OFF 2>&1 | tee configure.log
             grep -E 'CMAKE_GENERATOR:|Boost' build/CMakeCache.txt | head -10 || true
           elif [ "${{ matrix.os }}" = macos ]; then
             # Only what cmake/ cannot work out: the keg-only OpenSSL prefix, and RocksDB off
@@ -190,15 +229,33 @@ jobs:
             # Linux. Boost is not installed, so FDB compiles its own 1.78 - the supported
             # macOS path, and the slowest step in this job.
             cmake -S . -B build $COMMON -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DWITH_ROCKSDB=OFF \
+              -DSSD_ROCKSDB_EXPERIMENTAL=OFF \
               -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" 2>&1 | tee configure.log
           else
             # RocksDB off, as on the other two: it is 340 targets before fdbserver starts, and
             # a control configured unlike what it controls answers a different question. LLD
             # because a BFD link of fdbserver runs the runner out of memory.
             cmake -S . -B build $COMMON -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DWITH_ROCKSDB=OFF -DUSE_LD=LLD 2>&1 | tee configure.log
+              -DSSD_ROCKSDB_EXPERIMENTAL=OFF -DUSE_LD=LLD 2>&1 | tee configure.log
           fi
+
+      # The debug-symbol claim above, checked rather than argued. -ggdb on the actor files
+      # is what ran the runner out of memory, so if a future flag turns it back on this is
+      # where it should be caught -- not by a third exit 137 forty minutes into a build.
+      - name: Minimal debug symbols, and compressed
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          flags=$(grep -o -- '-ggdb1\?' build/compile_commands.json | sort -u | tr '\n' ' ')
+          gz=$(grep -c -- '-gz' build/compile_commands.json || true)
+          echo "debug flags in use: ${flags:-none}   -gz occurrences: $gz"
+          case "$flags" in
+            *"-ggdb "*|"-ggdb")
+              echo "::error::full debug symbols are on; ConfigureCompiler.cmake:185 was reached, which means FDB_RELEASE is set again"
+              exit 1 ;;
+          esac
+          [ "$gz" -gt 0 ] || { echo "::error::debug sections are not compressed; ConfigureCompiler.cmake:195 was skipped"; exit 1; }
+          echo "minimal symbols, compressed"
 
       # Each step stops the job, so a failure names the first thing that broke. --config Release
       # is what the Visual Studio generator needs and what Ninja ignores.
@@ -206,7 +263,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          cmake --build build --config Release --target fdb_c --parallel 2>&1 | tee build-fdb_c.log
+          cmake --build build --config Release --target fdb_c --parallel ${{ matrix.build_jobs }} 2>&1 | tee build-fdb_c.log
           rc=${PIPESTATUS[0]}
           grep -iE "error|fatal|Could NOT find|cannot open" build-fdb_c.log | head -60
           exit $rc
@@ -215,7 +272,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          cmake --build build --config Release --target fdbcli --parallel 2>&1 | tee build-fdbcli.log
+          cmake --build build --config Release --target fdbcli --parallel ${{ matrix.build_jobs }} 2>&1 | tee build-fdbcli.log
           rc=${PIPESTATUS[0]}
           grep -iE "error|fatal|Could NOT find|cannot open" build-fdbcli.log | head -60
           exit $rc
@@ -227,17 +284,28 @@ jobs:
         shell: bash
         run: |
           set +e
-          # GNU time takes -v, BSD time takes -l, and Windows has neither. The rockylinux9
-          # build image ships no /usr/bin/time at all, so it is probed rather than assumed:
-          # peak RSS is a diagnostic, and a missing diagnostic must not be the exit 127 that
-          # ends a 30-minute job.
+          # GNU time takes -v, BSD time takes -l, and Windows has neither. Probe for the
+          # binary rather than inferring it from the OS: the linux job runs inside
+          # foundationdb/build:rockylinux9-latest, which does not ship GNU time (it is a
+          # separate RPM), so assuming the platform implied the tool failed the build at
+          # exit 127 before cmake was ever reached. macOS carries it in the base system,
+          # which is why only linux broke and the failure looked like a compiler error.
+          #
+          # The measurement earns its keep (see the exit 137 note above), so install it
+          # when a package manager is present and fall back to an unmeasured build when
+          # it is not. Losing the peak-RSS line must not cost us the build.
           TIME=""
+          if [ ! -x /usr/bin/time ] && [ "${{ matrix.os }}" = linux ] && command -v dnf >/dev/null 2>&1; then
+            dnf install -y time >/dev/null 2>&1 || true
+          fi
           if [ -x /usr/bin/time ]; then
             [ "${{ matrix.os }}" = linux ] && TIME="/usr/bin/time -v"
             [ "${{ matrix.os }}" = macos ] && TIME="/usr/bin/time -l"
+          else
+            echo "note: /usr/bin/time absent; building without peak-RSS measurement"
           fi
           $TIME cmake --build build --config Release --target fdbserver \
-            --parallel ${{ matrix.fdbserver_jobs }} 2>&1 | tee build-fdbserver.log
+            --parallel ${{ matrix.build_jobs }} 2>&1 | tee build-fdbserver.log
           rc=${PIPESTATUS[0]}
           grep -iE "error|fatal|Could NOT find|cannot open" build-fdbserver.log | head -60
           grep -iE "maximum resident set size" build-fdbserver.log || true
@@ -273,7 +341,7 @@ jobs:
         run: |
           set +e
           cmake --build build --config Release \
-            --target fdbbackup fdbmonitor python_binding --parallel 2>&1 | tee build-pkgdeps.log
+            --target fdbbackup fdbmonitor python_binding --parallel ${{ matrix.build_jobs }} 2>&1 | tee build-pkgdeps.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
             grep -iE "error|fatal|Could NOT find" build-pkgdeps.log | head -30; exit $rc
